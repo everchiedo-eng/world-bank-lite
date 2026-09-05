@@ -1,0 +1,1 @@
+ALTER TABLE public.loans ALTER COLUMN collateral_deposit_id DROP NOT NULL;

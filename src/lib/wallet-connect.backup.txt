@@ -1,0 +1,261 @@
+import type { ChainKind } from "./chains";
+import { CHAINS } from "./chains";
+
+// Minimal typings for injected providers
+type Eip1193Provider = {
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+  isMetaMask?: boolean;
+  isTrust?: boolean;
+  isCoinbaseWallet?: boolean;
+  isRabby?: boolean;
+  providers?: Eip1193Provider[];
+};
+
+declare global {
+  interface Window {
+    ethereum?: Eip1193Provider;
+    solana?: {
+      isPhantom?: boolean;
+      connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: { toString(): string } }>;
+      publicKey?: { toString(): string };
+    };
+  }
+}
+
+export type ConnectResult = { address: string; chain: ChainKind };
+
+function isMobile(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent);
+}
+
+function isInWalletBrowser(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent.toLowerCase();
+  return (
+    ua.includes("metamaskmobile") ||
+    ua.includes("trust/") ||
+    ua.includes("trustwallet") ||
+    ua.includes("coinbasewallet") ||
+    ua.includes("imtoken")
+  );
+}
+
+function discoverProvidersViaEip6963(timeoutMs = 400): Promise<Eip1193Provider[]> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined") return resolve([]);
+    const found: Eip1193Provider[] = [];
+    const onAnnounce = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { provider?: Eip1193Provider } | undefined;
+      if (detail?.provider && !found.includes(detail.provider)) found.push(detail.provider);
+    };
+    window.addEventListener("eip6963:announceProvider", onAnnounce as EventListener);
+    window.dispatchEvent(new Event("eip6963:requestProvider"));
+    window.setTimeout(() => {
+      window.removeEventListener("eip6963:announceProvider", onAnnounce as EventListener);
+      resolve(found);
+    }, timeoutMs);
+  });
+}
+
+function waitForInjected(timeoutMs = 800): Promise<Eip1193Provider | undefined> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined") return resolve(undefined);
+    if (window.ethereum) return resolve(window.ethereum);
+    const start = Date.now();
+    const id = window.setInterval(() => {
+      if (window.ethereum || Date.now() - start > timeoutMs) {
+        window.clearInterval(id);
+        resolve(window.ethereum);
+      }
+    }, 50);
+  });
+}
+
+async function resolveEvmProvider(prefer?: "metamask" | "trust" | "coinbase"): Promise<Eip1193Provider | undefined> {
+  const announced = await discoverProvidersViaEip6963();
+  const match = (p: Eip1193Provider) =>
+    prefer === "metamask" ? !!p.isMetaMask :
+    prefer === "trust" ? !!p.isTrust :
+    prefer === "coinbase" ? !!p.isCoinbaseWallet :
+    (p.isMetaMask || p.isTrust || p.isCoinbaseWallet);
+  const best6963 = announced.find(match) ?? (prefer ? undefined : announced[0]);
+  if (best6963) return best6963;
+
+  const eth = await waitForInjected();
+  if (!eth) return undefined;
+  if (Array.isArray(eth.providers) && eth.providers.length) {
+    return eth.providers.find(match) ?? (prefer ? undefined : eth.providers[0]);
+  }
+  if (prefer && !match(eth)) return undefined;
+  return eth;
+}
+
+export type WalletMethod = "metamask" | "trust" | "walletconnect" | "phantom" | "auto";
+
+
+// ============================================================================
+// WalletConnect v2 — lets a desktop browser pair with a mobile wallet by QR.
+// ============================================================================
+
+// Public WalletConnect Cloud project id. Replace with your own for production.
+const WC_PROJECT_ID =
+  (import.meta.env.VITE_WALLETCONNECT_PROJECT_ID as string | undefined) ||
+  "3fcc6bba6f1de962d911bb5b5c3dba68";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let wcProvider: any = null;
+
+async function getWalletConnectProvider(): Promise<any> {
+  const { EthereumProvider } = await import("@walletconnect/ethereum-provider");
+  if (wcProvider) return wcProvider;
+  wcProvider = await EthereumProvider.init({
+    projectId: WC_PROJECT_ID,
+    chains: [1], // eth mainnet default; we switch after connect
+    optionalChains: [1, 56, 137],
+    showQrModal: true,
+    metadata: {
+      name: "Chainvault",
+      description: "Deposit collateral & borrow across chains",
+      url: typeof window !== "undefined" ? window.location.origin : "https://chainvault.app",
+      icons: [],
+    },
+  });
+  return wcProvider;
+}
+
+/** Fully reset the WalletConnect pairing (kills any stale session so the QR modal reopens cleanly). */
+export async function resetWalletConnect(): Promise<void> {
+  try {
+    if (wcProvider?.session) {
+      try { await wcProvider.disconnect(); } catch { /* ignore */ }
+    }
+  } finally {
+    wcProvider = null;
+    if (typeof window !== "undefined") {
+      try {
+        Object.keys(window.localStorage)
+          .filter((k) => k.startsWith("wc@2:") || k.startsWith("walletconnect"))
+          .forEach((k) => window.localStorage.removeItem(k));
+      } catch { /* ignore */ }
+    }
+  }
+}
+
+/** Open the WalletConnect QR modal directly (desktop → phone pairing), independent of chain selection. */
+export async function openWalletConnectQr(chain: ChainKind = "ethereum"): Promise<ConnectResult> {
+  return connectViaWalletConnect(chain);
+}
+
+async function connectViaWalletConnect(chain: ChainKind): Promise<ConnectResult> {
+  const meta = CHAINS[chain];
+  if (!meta.evmChainId) throw new Error(`${meta.name} is not an EVM chain`);
+  const provider = await getWalletConnectProvider();
+  if (!provider.session) {
+    await provider.connect({ chains: [meta.evmChainId] });
+  }
+  const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+  if (!accounts?.[0]) throw new Error("Wallet did not return an account");
+  try {
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: "0x" + meta.evmChainId.toString(16) }],
+    });
+  } catch { /* user can switch manually */ }
+  return { address: accounts[0], chain };
+}
+
+function openInWalletBrowser(walletHint?: "metamask" | "trust"): never {
+  const host = window.location.host + window.location.pathname + window.location.search;
+  const url =
+    walletHint === "trust"
+      ? `https://link.trustwallet.com/open_url?coin_id=60&url=${encodeURIComponent(window.location.href)}`
+      : `https://metamask.app.link/dapp/${host}`;
+  window.location.href = url;
+  throw new Error("Opening in your wallet's in-app browser…");
+}
+
+/** Connect an EVM wallet. Uses injected wallet if available, otherwise WalletConnect QR. */
+export async function connectEvm(chain: ChainKind): Promise<ConnectResult> {
+  const meta = CHAINS[chain];
+  if (!meta.evmChainId) throw new Error(`${meta.name} is not an EVM chain`);
+  if (typeof window === "undefined") throw new Error("Browser required");
+
+  const provider = await resolveEvmProvider();
+  if (provider) {
+    const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+    if (!accounts?.[0]) throw new Error("No account returned from wallet");
+    try {
+      await provider.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: "0x" + meta.evmChainId.toString(16) }],
+      });
+    } catch { /* non-fatal */ }
+    return { address: accounts[0], chain };
+  }
+
+  // No injected wallet. On desktop, fall back to WalletConnect QR (scans with phone wallet).
+  if (!isMobile()) {
+    return connectViaWalletConnect(chain);
+  }
+
+  // On mobile with no wallet in this browser, deep-link into a wallet app.
+  if (!isInWalletBrowser()) openInWalletBrowser("metamask");
+  throw new Error("Open MetaMask or Trust Wallet and use its built-in browser to visit this site.");
+}
+
+export async function connectSolana(): Promise<ConnectResult> {
+  if (typeof window === "undefined") throw new Error("Browser required");
+  if (!window.solana) {
+    if (isMobile()) {
+      const url = `https://phantom.app/ul/browse/${encodeURIComponent(window.location.href)}?ref=${encodeURIComponent(window.location.origin)}`;
+      window.location.href = url;
+      throw new Error("Opening Phantom's in-app browser…");
+    }
+    throw new Error("Phantom wallet not detected. Install the Phantom extension to continue.");
+  }
+  const res = await window.solana.connect();
+  return { address: res.publicKey.toString(), chain: "solana" };
+}
+
+export async function connectChain(chain: ChainKind): Promise<ConnectResult> {
+  if (chain === "solana") return connectSolana();
+  return connectEvm(chain);
+}
+
+/** Connect using a specific wallet method. */
+export async function connectWithMethod(chain: ChainKind, method: WalletMethod): Promise<ConnectResult> {
+  if (chain === "solana") return connectSolana();
+  const meta = CHAINS[chain];
+  if (!meta.evmChainId) throw new Error(`${meta.name} is not an EVM chain`);
+
+  if (method === "walletconnect") return connectViaWalletConnect(chain);
+
+  if (method === "metamask" || method === "trust") {
+    const preferKey = method;
+    const provider = await resolveEvmProvider(preferKey);
+    if (provider) {
+      const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+      if (!accounts?.[0]) throw new Error("No account returned from wallet");
+      try {
+        await provider.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: "0x" + meta.evmChainId.toString(16) }],
+        });
+      } catch { /* non-fatal */ }
+      return { address: accounts[0], chain };
+    }
+    // Not injected — deep-link on mobile, or fall back to WalletConnect QR on desktop.
+    if (isMobile() && !isInWalletBrowser()) openInWalletBrowser(method === "trust" ? "trust" : "metamask");
+    if (!isMobile()) return connectViaWalletConnect(chain);
+    throw new Error(`Open ${method === "trust" ? "Trust Wallet" : "MetaMask"} and use its built-in browser to visit this site.`);
+  }
+
+  return connectEvm(chain);
+}
+
+
+export function shortAddress(a: string): string {
+  if (!a) return "";
+  return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
+}
